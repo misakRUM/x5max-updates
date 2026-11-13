@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>X5max – samostatný test Transitous podle GPS</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#090f19;color:#f3f7fc}
+*{box-sizing:border-box}body{margin:0;padding:18px 15px 60px;max-width:760px;margin-inline:auto;line-height:1.45}
+h1{font-size:1.7rem;margin:8px 0}h2{font-size:1.15rem;color:#55b9f5;margin:0 0 10px}
+small,.muted{color:#adbbcc}p{margin:9px 0 16px}.card{background:#192638;border-radius:16px;padding:16px;margin:14px 0}
+button{font:inherit;background:#54b8f5;color:#08131f;border:0;border-radius:12px;padding:13px 17px;font-weight:700;margin:5px 5px 6px 0;cursor:pointer}
+button.secondary{background:#283e56;color:#eff8ff}button:disabled{opacity:.5;cursor:default}
+.error{color:#ffa6a3}.ok{color:#48e0a0}.warning{color:#ffd184}.mono{font-family:ui-monospace,Consolas,monospace;overflow-wrap:anywhere;font-size:.88rem}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:.78rem;background:#091624;padding:10px;border-radius:8px;max-height:320px;overflow-y:auto}
+.row{border-top:1px solid #3a4e64;padding:9px 0}.row strong{color:#eaf4ff}.pill{color:#fff3cd}
+#results{margin-top:10px}a{color:#7dccff}#coordinates{font-size:.82rem}footer{font-size:.83rem;color:#adbbcc;margin-top:24px}
+</style>
+</head>
+<body>
+<h1>Test MHD podle GPS</h1>
+<p class="muted">Samostatný test Transitous mimo X5max. Výchozím bodem je <strong>aktuální poloha telefonu</strong>, cílem je Šenovská 543/101, Ostrava.</p>
+<div class="card">
+<h2>1. Získání polohy a vyhledání</h2>
+<p>Po stisknutí tlačítka telefon požádá o oprávnění k poloze. Souřadnice se odešlou <strong>přímo službě Transitous</strong> pro vyhledání cesty. Stránka je neukládá na GitHub ani je neposílá do ChatGPT.</p>
+<button id="start">Použít GPS a vyhledat spoje</button>
+<button id="copy" class="secondary" disabled>Zkopírovat výsledek bez GPS</button>
+<div id="status" aria-live="polite" class="muted">Připraveno. Pro test povol v prohlížeči přesnou polohu.</div>
+<div id="coordinates" class="muted"></div>
+</div>
+<div id="results"></div>
+<footer>Zdroj: Transitous, jízdní řády. Datum a čas se porovnávají jako skutečné časové okamžiky. Test je nezávislý na aplikaci X5max.</footer>
+<script>
+"use strict";
+const endpoint="https://api.transitous.org/api/v6/plan";
+const target="49.817604,18.320103";
+const zone="Europe/Prague";
+const $=id=>document.getElementById(id);
+const fmt=new Intl.DateTimeFormat("cs-CZ",{timeZone:zone,day:"2-digit",month:"2-digit",year:"numeric",hour:"2-digit",minute:"2-digit"});
+let shareText="";
+const isWalk=leg=>["WALK","FOOT"].includes(String(leg.mode||"").toUpperCase());
+const ts=value=>{const x=Date.parse(value);return Number.isFinite(x)?x:NaN;};
+const ftime=value=>Number.isFinite(value)?fmt.format(new Date(value)):"neplatný čas";
+const setStatus=(message,cl="muted")=>{const e=$("status");e.textContent=message;e.className=cl;};
+const esc=s=>String(s??"");
+function make(tag,txt,cls){const e=document.createElement(tag);if(txt!==undefined)e.textContent=txt;if(cls)e.className=cls;return e;}
+function append(parent,...items){for(const e of items)parent.appendChild(e);}
+function query(from,now,timetable){
+  const params=new URLSearchParams({
+    fromPlace:from,toPlace:target,time:new Date(now).toISOString(),
+    arriveBy:"false",timetableView:timetable?"true":"false",
+    maxPreTransitTime:"1800",maxPostTransitTime:"1800"
+  });
+  if(timetable){params.set("searchWindow","3600");params.set("numItineraries","5");}
+  return endpoint+"?"+params.toString();
+}
+async function call(name,url,now){
+  const section=make("section",undefined,"card");
+  const heading=make("h2",name);section.appendChild(heading);$("results").appendChild(section);
+  const diag=[];
+  try{
+    const response=await fetch(url,{headers:{Accept:"application/json"},cache:"no-store",signal:AbortSignal.timeout(25000)});
+    if(!response.ok)throw new Error("HTTP "+response.status+" "+response.statusText);
+    const data=await response.json();
+    if(!Array.isArray(data.itineraries))throw new Error("Odpověď neobsahuje pole itineraries. Klíče: "+Object.keys(data).join(", "));
+    const trips=data.itineraries.map(item=>{
+      const start=ts(item.startTime),arrive=ts(item.endTime);
+      const legs=Array.isArray(item.legs)?item.legs:[];
+      const vehicle=legs.find(l=>!isWalk(l));
+      const firstVehicle=vehicle?ts(vehicle.startTime):NaN;
+      const before=vehicle?legs.slice(0,legs.indexOf(vehicle)).filter(isWalk):[];
+      const walkSeconds=before.reduce((a,l)=>a+Math.max(0,(ts(l.endTime)-ts(l.startTime))/1000||0),0);
+      const departureFeasible=Number.isFinite(firstVehicle)?firstVehicle-walkSeconds:start;
+      const modes=legs.map(l=>esc(l.mode)).join(" → ");
+      return {start,arrive,firstVehicle,departureFeasible,modes};
+    });
+    const starts=trips.map(t=>t.start).filter(Number.isFinite).sort((a,b)=>a-b);
+    const future=trips.filter(t=>Number.isFinite(t.departureFeasible)&&t.departureFeasible>=now).sort((a,b)=>a.departureFeasible-b.departureFeasible);
+    append(section,make("p","Vráceno: "+trips.length+" tras. Stihnutelných podle odchodu pěšky: "+future.length+".",future.length?"ok":"warning"));
+    const range=starts.length?"Časy cest v odpovědi: "+ftime(starts[0])+" až "+ftime(starts[starts.length-1]):"Žádné platné časové údaje v trasách";
+    section.appendChild(make("p",range,"muted"));
+    diag.push(name+": "+trips.length+" tras, "+future.length+" stihnutelných; "+range);
+    if(trips.length&&!future.length){
+      section.appendChild(make("p","Server vrátil pouze spojení, která z této GPS polohy již nelze stihnout.", "warning"));
+    }
+    const shown=(future.length?future:trips).slice(0,8);
+    for(const t of shown){
+      const line=make("div",undefined,"row");
+      const title=make("strong",(Number.isFinite(t.firstVehicle)?"První spoj "+ftime(t.firstVehicle):"Pěší cesta od "+ftime(t.start))+" → příjezd "+ftime(t.arrive));
+      append(line,title,make("div","Odejít pěšky: "+ftime(t.departureFeasible)+" · "+t.modes,"muted"));
+      section.appendChild(line);
+    }
+    const raw=make("details");
+    const summary=make("summary","Technické informace");
+    const pre=make("pre",JSON.stringify({count:trips.length,nextPageCursor:data.nextPageCursor||null,requestDate:ftime(now),range:range},null,2));
+    append(raw,summary,pre);section.appendChild(raw);
+  }catch(err){
+    const message=err instanceof TypeError?
+      "Prohlížeč nedovolil přečíst odpověď Transitous (možné omezení CORS nebo síť). Zkus otevřít přímou URL dotazu níže.":
+      "Chyba dotazu: "+(err.message||String(err));
+    section.appendChild(make("p",message,"error"));
+    diag.push(name+": "+message);
+  }
+  const a=make("a","Otevřít surovou odpověď API");
+  a.href=url;a.target="_blank";a.rel="noopener noreferrer";section.appendChild(a);
+  // The report deliberately excludes the query URL and all GPS coordinates.
+  return diag.join("\n");
+}
+async function runAt(lat,lon,accuracy){
+  const now=Date.now();
+  const origin=lat.toFixed(6)+","+lon.toFixed(6);
+  $("coordinates").textContent="GPS přesnost: ±"+Math.round(accuracy)+" m. Použity právě načtené souřadnice.";
+  $("results").replaceChildren();
+  setStatus("GPS načtena. Dotazuji se Transitous…");
+  try{
+    const a=await call("A. Přehled odjezdů (timetableView = true)",query(origin,now,true),now);
+    const b=await call("B. Běžné hledání odjezdu (timetableView = false)",query(origin,now,false),now);
+    shareText="X5max: nezávislý GPS test Transitous\nTestováno: "+ftime(now)+
+      "\nVýchozí poloha: GPS telefonu, přesnost ±"+Math.round(accuracy)+" m (souřadnice vynechány)"+
+      "\nCíl: Šenovská 543/101, Ostrava\n"+a+"\n"+b;
+    $("copy").disabled=false;
+    setStatus("Test dokončen. Pro sdílení zkopíruj anonymizovaný výsledek.","ok");
+  }finally{$("start").disabled=false;}
+}
+$("start").addEventListener("click",()=>{
+  if(!window.isSecureContext){setStatus("GPS vyžaduje zabezpečenou HTTPS stránku. Otevři test přes HTTPS odkaz.","error");return;}
+  if(!navigator.geolocation){setStatus("Prohlížeč nepodporuje načítání GPS. Otevři stránku v Chrome na telefonu.","error");return;}
+  $("start").disabled=true;$("copy").disabled=true;
+  setStatus("Zjišťuji aktuální GPS polohu…");
+  navigator.geolocation.getCurrentPosition(
+    p=>runAt(p.coords.latitude,p.coords.longitude,p.coords.accuracy).catch(e=>{setStatus("Chyba: "+e.message,"error");$("start").disabled=false;}),
+    e=>{setStatus("GPS nelze načíst ("+e.code+"): "+e.message+". V prohlížeči povol stránce polohu.","error");$("start").disabled=false;},
+    {enableHighAccuracy:true,timeout:20000,maximumAge:0}
+  );
+});
+$("copy").addEventListener("click",async()=>{
+  try{await navigator.clipboard.writeText(shareText);setStatus("Výsledek bez přesných GPS souřadnic zkopírován.","ok");}
+  catch(_){setStatus("Kopírování nebylo povoleno. Výsledek můžeš opsat nebo vyfotit.","warning");}
+});
+</script>
+</body>
+</html>
